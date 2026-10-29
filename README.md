@@ -1,5 +1,7 @@
 # Wi-Fi Music Sharing - Phase 1: Android internal-audio capture test
 
+This is a testing application for the `wifi-audio-sharing` project.
+
 This is a **source project**, not a built APK. It tests whether ordinary Android APIs can capture YouTube ReVanced playback, without using the microphone. **No Wi-Fi streaming has been implemented yet.**
 
 ## Requirements
