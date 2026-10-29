@@ -7,10 +7,13 @@ import java.net.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** A basic one-host Wi-Fi PCM listener. No relay or internet connection required. */
-class LegacyAudioListener(private val host: String, private val status: (String) -> Unit) {
+class LegacyAudioListener(private val host: String, private val status: (String) -> Unit, private val onStopped: () -> Unit = {}, private val network: android.net.Network? = null) {
     private val running = AtomicBoolean(false)
     private var socket: DatagramSocket? = null
     private var thread: Thread? = null
+    @Volatile private var output: AudioTrack? = null
+    @Volatile var volume = 1f
+        set(value) { field = value.coerceIn(0f, 1f); runCatching { output?.setVolume(field) } }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -23,7 +26,7 @@ class LegacyAudioListener(private val host: String, private val status: (String)
             val address = InetAddress.getByName(host)
             require(address is Inet4Address) { "Use the host phone's IPv4 address" }
             val target = InetSocketAddress(address, CaptureService.PORT)
-            val udp = DatagramSocket().apply { soTimeout = 1000 }
+            val udp = DatagramSocket().apply { soTimeout = 1000; network?.bindSocket(this) }
             socket = udp
             val minBuffer = AudioTrack.getMinBufferSize(CaptureService.SAMPLE_RATE,
                 AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -38,12 +41,14 @@ class LegacyAudioListener(private val host: String, private val status: (String)
                 .setBufferSizeInBytes(maxOf(minBuffer * 2, 19200))
                 .build()
             require(track.state == AudioTrack.STATE_INITIALIZED)
+            output = track; track.setVolume(volume)
             track.play()
             val packetBytes = ByteArray(4 + 2 * CaptureService.SAMPLES_PER_PACKET)
             val join = "JOIN_WIFI_AUDIO_V1".toByteArray(Charsets.US_ASCII)
             var lastJoin = 0L
             var received = 0
             var lastSeq: Long? = null
+            var lastReceive = android.os.SystemClock.elapsedRealtime()
             while (running.get()) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (now - lastJoin >= 2000) {
@@ -59,10 +64,12 @@ class LegacyAudioListener(private val host: String, private val status: (String)
                         ((b[2].toLong() and 255) shl 8) or (b[3].toLong() and 255)
                     if (lastSeq != null && seq <= lastSeq && lastSeq - seq < 0x7fffffffL) continue
                     lastSeq = seq
+                    lastReceive = android.os.SystemClock.elapsedRealtime()
                     track.write(b, 4, packet.length - 4, AudioTrack.WRITE_BLOCKING)
                     received++
                     if (received == 5) status("Connected. Playing live audio from $host")
                 } catch (_: SocketTimeoutException) {
+                    check(android.os.SystemClock.elapsedRealtime() - lastReceive < 6000) { "No audio for 6 seconds. Check host and Wi-Fi" }
                     if (received == 0) status("Waiting for host audio at $host. Check IP and Wi-Fi isolation.")
                 }
             }
@@ -73,8 +80,10 @@ class LegacyAudioListener(private val host: String, private val status: (String)
         } finally {
             running.set(false)
             try { track?.stop() } catch (_: Exception) {}
+            output = null
             track?.release()
             socket?.close(); socket = null
+            output = null; onStopped()
         }
     }
 

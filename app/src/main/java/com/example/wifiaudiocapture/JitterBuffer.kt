@@ -12,7 +12,6 @@ class JitterBuffer(val minimumMs: Int = 80, private val capacity: Int = 24) {
     private var anchorSeq = 0
     private var anchorCapture = 0L
     private var localStart = 0L
-    private var started = false
     private var lastTransit: Long? = null
     private var jitterNs = 0.0
     private var lastTune = 0L
@@ -43,18 +42,23 @@ class JitterBuffer(val minimumMs: Int = 80, private val capacity: Int = 24) {
             dropped += packets.size; packets.clear()
             expected = packet.sequence; anchorSeq = packet.sequence
             anchorCapture = packet.captureNs; localStart = arrivalNs
-            started = false; resyncs++; pendingReset = true
+            resyncs++; pendingReset = true
         }
         if (packets.containsKey(packet.sequence)) { dropped++; return }
         if (packets.size >= capacity) { dropped++; return }
         packets[packet.sequence] = packet
+        // Follow the capture sample clock, including its drift relative to the phone clock.
+        if (AudioPacket.distance(packet.sequence, anchorSeq) >= 0) {
+            anchorSeq = packet.sequence; anchorCapture = packet.captureNs
+            localStart = arrivalNs
+        }
     }
     @Synchronized fun poll(nowNs: Long, hostOffsetNs: Long?, outputQueueNs: Long = 0): Frame? {
         var seq = expected ?: return null
         val targetNs = targetMs * 1_000_000L
         fun deadline(s: Int): Long {
             val elapsed = AudioPacket.distance(s, anchorSeq).toLong() * AudioPacket.FRAME_NS
-            return if (hostOffsetNs != null) anchorCapture + elapsed + targetNs - hostOffsetNs
+            return if (hostOffsetNs != null) (packets[s]?.captureNs ?: (anchorCapture + elapsed)) + targetNs - hostOffsetNs
                    else localStart + elapsed + targetNs
         }
         if (nowNs + outputQueueNs < deadline(seq)) return null
@@ -65,12 +69,11 @@ class JitterBuffer(val minimumMs: Int = 80, private val capacity: Int = 24) {
         }
         if (skipped > 0) { expected = seq; resyncs++; pendingReset = true }
         if (skipped == capacity && packets.isEmpty()) {
-            expected = null; started = false; return null
+            expected = null; return null
         }
         val packet = packets.remove(seq)
         expected = seq + 1
         if (packet == null) underruns++
-        started = true
         val reset = pendingReset; pendingReset = false
         return Frame(packet, packet == null, reset)
     }

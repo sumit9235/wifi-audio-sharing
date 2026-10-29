@@ -5,6 +5,13 @@ import java.io.ByteArrayInputStream
 
 class StreamProtocolTest {
     private fun packet(seq: Int, time: Long = 1_000_000_000L) = AudioPacket(42, 7, seq, 480L, time, ByteArray(960) { it.toByte() })
+    @Test fun phaseTwoWireCompatibilityGoldenPacket() {
+        val pcm = ByteArray(960).apply { this[0] = 0x34; this[1] = 0x12; this[959] = -1 }
+        val bytes = AudioPacket.legacy(0x12345678, pcm)
+        assertEquals(964, bytes.size)
+        assertArrayEquals(byteArrayOf(0x12, 0x34, 0x56, 0x78, 0x34, 0x12), bytes.copyOfRange(0,6))
+        assertEquals((-1).toByte(), bytes.last())
+    }
     @Test fun packetRoundTripAndBounds() {
         val source = packet(Int.MAX_VALUE)
         val bytes = source.encode()
@@ -72,5 +79,18 @@ class StreamProtocolTest {
         assertTrue(played > 88_000)
         assertTrue(maxDepth < 20)
         assertTrue(b.targetMs in 80..90)
+    }
+    @Test fun captureClockDriftUsesPacketTimestamps() {
+        val b = JitterBuffer()
+        var played = 0
+        repeat(90_000) { seq ->
+            // 100 ppm slow capture clock: 90 ms drift over 15 simulated minutes.
+            val time = 1_000_000_000L + seq * 10_001_000L
+            b.offer(AudioPacket(1, 2, seq, seq * 480L, time, ByteArray(960)), time + 2_000_000)
+            if (b.poll(time + 2_000_000, 0)?.packet != null) played++
+            assertTrue(b.depth() <= 24)
+        }
+        assertTrue(played > 89_000)
+        assertEquals(0L, b.resyncs)
     }
 }

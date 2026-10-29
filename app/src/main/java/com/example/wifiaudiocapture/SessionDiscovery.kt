@@ -32,6 +32,8 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
     private var browser: NsdManager.DiscoveryListener? = null
     private var registration: NsdManager.RegistrationListener? = null
     private var networkRegistered = false
+    private val wifiRequest = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+    private fun wifiNetwork() = connectivity.allNetworks.firstOrNull { connectivity.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) { main.post { if (!closed) { status("Wi-Fi available. Refresh sessions if needed.") } } }
         override fun onLost(network: Network) { main.post {
@@ -41,8 +43,8 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
     }
     fun advertise(name: String, port: Int = CaptureService.PORT) {
         val listener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(info: NsdServiceInfo) { status("Visible as ${info.serviceName}") }
-            override fun onRegistrationFailed(info: NsdServiceInfo, error: Int) { status("Discovery advertisement failed ($error). Join by IP is available.") }
+            override fun onServiceRegistered(info: NsdServiceInfo) { main.post { if (!closed) status("Visible as ${info.serviceName}") } }
+            override fun onRegistrationFailed(info: NsdServiceInfo, error: Int) { main.post { if (!closed) status("Discovery advertisement failed ($error). Join by IP is available.") } }
             override fun onServiceUnregistered(info: NsdServiceInfo) = Unit
             override fun onUnregistrationFailed(info: NsdServiceInfo, error: Int) = Unit
         }
@@ -51,6 +53,7 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
             serviceName = "Wi-Fi Audio ${name.take(24)}"
             serviceType = if (port == CaptureService.PORT) "_wifiaudio._udp." else TYPE
             this.port = port
+            if (android.os.Build.VERSION.SDK_INT >= 33) network = wifiNetwork()
             setAttribute("version", if (port == CaptureService.PORT) "1" else "2")
         }
         try { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
@@ -64,12 +67,13 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
             networkRegistered = true
         }
         val listener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(type: String) { status("Looking for sessions on this Wi-Fi…") }
+            override fun onDiscoveryStarted(type: String) { main.post { if (!closed && browser === this) status("Looking for sessions on this Wi-Fi…") } }
             override fun onServiceFound(info: NsdServiceInfo) { main.post {
                 if (browser !== this || closed || !found.add(info.serviceName)) return@post
                 pending.add(info); resolveNext()
             } }
             override fun onServiceLost(info: NsdServiceInfo) { main.post {
+                if (browser !== this || closed) return@post
                 found.remove(info.serviceName); sessions.remove(info.serviceName); changed(sessions.values.toList())
             } }
             override fun onDiscoveryStopped(type: String) = Unit
@@ -77,7 +81,11 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
             override fun onStopDiscoveryFailed(type: String, error: Int) = Unit
         }
         browser = listener
-        try { nsd.discoverServices(TYPE, NsdManager.PROTOCOL_DNS_SD, listener) }
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33)
+                nsd.discoverServices(TYPE, NsdManager.PROTOCOL_DNS_SD, wifiRequest, java.util.concurrent.Executor { main.post(it) }, listener)
+            else nsd.discoverServices(TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+        }
         catch (e: Exception) { status("Discovery unavailable. Check Wi-Fi or join by IP: ${e.message}") }
     }
     private fun resolveNext() {
@@ -85,7 +93,7 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
         val info = pending.removeFirst()
         val epoch = generation
         resolving = true
-        nsd.resolveService(info, object : NsdManager.ResolveListener {
+        try { nsd.resolveService(info, object : NsdManager.ResolveListener {
             override fun onResolveFailed(service: NsdServiceInfo, error: Int) { main.post {
                 resolving = false
                 if (epoch == generation) found.remove(service.serviceName)
@@ -102,7 +110,7 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
                 }
                 resolveNext()
             } }
-        })
+        }) } catch (_: Exception) { resolving = false; found.remove(info.serviceName); resolveNext() }
     }
     private fun stopBrowser() {
         generation++

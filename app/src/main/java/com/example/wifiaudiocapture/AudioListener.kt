@@ -9,31 +9,32 @@ import kotlin.math.max
 /** Receiver, control clock exchange and playout are independently cancellable. */
 class AudioListener(private val host: String, private val status: (String) -> Unit,
                     private val legacy: Boolean = false, private val targetMs: Int = 80,
-                    private val name: String = "Listener") {
+                    private val name: String = "Listener", private val onStopped: () -> Unit = {}, private val network: android.net.Network? = null) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val running = AtomicBoolean(false)
     @Volatile private var udp: DatagramSocket? = null
     @Volatile private var control: Socket? = null
     @Volatile private var track: AudioTrack? = null
     @Volatile var volume = 1f
-        set(value) { field = value.coerceIn(0f, 1f); track?.setVolume(field) }
+        set(value) { field = value.coerceIn(0f, 1f); runCatching { track?.setVolume(field) }; baseline?.volume = field }
     private var baseline: LegacyAudioListener? = null
     fun start() {
         if (!running.compareAndSet(false, true)) return
         if (legacy) {
-            baseline = LegacyAudioListener(host, status).also { it.start() }; return
+            baseline = LegacyAudioListener(host, status, onStopped, network).also { it.volume = volume; it.start() }; return
         }
         scope.launch {
             try { listen() }
             catch (e: Exception) { if (running.get()) status("Disconnected: ${e.message}. Check Wi-Fi and tap Join to retry.") }
-            finally { running.set(false); control?.close(); udp?.close() }
+            finally { running.set(false); control?.close(); udp?.close(); onStopped() }
         }
     }
     private suspend fun listen() = coroutineScope {
         val address = InetAddress.getByName(host)
         require(address is Inet4Address && HostTransport.local(address)) { "Enter a local Wi-Fi IPv4 address" }
-        val socket = DatagramSocket().apply { soTimeout = 1000; receiveBufferSize = 64 * 1024 }; udp = socket
+        val socket = DatagramSocket().apply { soTimeout = 1000; receiveBufferSize = 64 * 1024; network?.bindSocket(this) }; udp = socket
         val tcp = Socket(); control = tcp
+        network?.bindSocket(tcp)
         tcp.connect(InetSocketAddress(address, ControlProtocol.PORT), 4000)
         tcp.soTimeout = 6000; tcp.tcpNoDelay = true
         val input = tcp.getInputStream(); val output = tcp.getOutputStream()
@@ -42,9 +43,12 @@ class AudioListener(private val host: String, private val status: (String) -> Un
         require(info.size == 7 && info[0] == "SESSION" && info[1] == "2" && info[4] == "PCM16" && info[5] == "48000" && info[6] == "1") { "Incompatible host; install the same APK on both phones" }
         val session = info[2].toLong(); val stream = info[3].toInt()
         ControlProtocol.write(output, ControlProtocol.hello(session, socket.localPort, name))
+        status("Waiting for host approval (up to 30 seconds)…")
+        tcp.soTimeout = 35000
         val welcome = ControlProtocol.read(input)
         require(welcome == "WELCOME 2 $session $stream PCM16 48000 1") { welcome.removePrefix("ERROR ") }
-        val clock = ClockSync(); val jitter = JitterBuffer(targetMs)
+        tcp.soTimeout = 6000
+        val clock = ClockSync()
         // Establish a clock estimate before receiving/playout rather than shift clocks mid-buffer.
         suspend fun sync() {
             val t1 = System.nanoTime()
@@ -62,12 +66,22 @@ class AudioListener(private val host: String, private val status: (String) -> Un
             .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(AudioPacket.RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
             .setTransferMode(AudioTrack.MODE_STREAM).setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .setBufferSizeInBytes(max(minBuffer * 2, AudioPacket.PCM_BYTES * 4)).build()
-        require(player.state == AudioTrack.STATE_INITIALIZED)
-        track = player; player.setVolume(volume)
-        player.setBufferSizeInFrames(max(minBuffer / 2, AudioPacket.SAMPLES * 2))
-        if (android.os.Build.VERSION.SDK_INT >= 31) player.setStartThresholdInFrames(AudioPacket.SAMPLES)
-        var received = 0L; var invalid = 0L; var lastReceive = System.nanoTime()
         try {
+            require(player.state == AudioTrack.STATE_INITIALIZED)
+            track = player; player.setVolume(volume)
+            player.setBufferSizeInFrames(max(minBuffer / 2, AudioPacket.SAMPLES * 2))
+            if (android.os.Build.VERSION.SDK_INT >= 31) player.setStartThresholdInFrames(AudioPacket.SAMPLES)
+            val warmupMs = if (android.os.Build.VERSION.SDK_INT >= 31) 10
+                           else (player.bufferSizeInFrames * 1000 / AudioPacket.RATE)
+            val actualTarget = max(targetMs, warmupMs + 20)
+            check(actualTarget <= 180) { "This output needs a large startup buffer. Try wired audio or Phase 2 compatibility" }
+            val jitter = JitterBuffer(actualTarget)
+            val queueLimitNs = maxOf(40_000_000L, warmupMs * 1_000_000L)
+            val received = java.util.concurrent.atomic.AtomicLong()
+            val invalid = java.util.concurrent.atomic.AtomicLong()
+            val decodeNs = java.util.concurrent.atomic.AtomicLong()
+            val networkAgeNs = java.util.concurrent.atomic.AtomicLong()
+            var lastReceive = System.nanoTime()
             launch {
                 while (isActive) { delay(2000); sync() }
             }
@@ -77,10 +91,18 @@ class AudioListener(private val host: String, private val status: (String) -> Un
                     try {
                         val datagram = DatagramPacket(bytes, bytes.size); socket.receive(datagram)
                         if (datagram.address != address) continue
+                        val decodeStart = System.nanoTime()
                         val packet = AudioPacket.decode(bytes, datagram.length)
-                        if (packet == null || packet.session != session || packet.stream != stream) { invalid++; continue }
+                        decodeNs.addAndGet(System.nanoTime() - decodeStart)
+                        if (packet == null || packet.session != session || packet.stream != stream) { invalid.incrementAndGet(); continue }
                         val now = System.nanoTime()
-                        jitter.offer(packet, now); received++; lastReceive = now
+                        if (packet.mediaSample % AudioPacket.SAMPLES != 0L ||
+                            packet.sequence != (packet.mediaSample / AudioPacket.SAMPLES).toInt() ||
+                            packet.captureNs !in (now + clock.offsetNs - 6_000_000_000L)..(now + clock.offsetNs + 1_000_000_000L)) {
+                            invalid.incrementAndGet(); continue
+                        }
+                        networkAgeNs.set(now + clock.offsetNs - packet.captureNs)
+                        jitter.offer(packet, now); received.incrementAndGet(); lastReceive = now
                     } catch (_: SocketTimeoutException) {
                         check(System.nanoTime() - lastReceive < 6_000_000_000L) { "No audio for 6 seconds. Host stopped or Wi-Fi changed" }
                     }
@@ -100,7 +122,7 @@ class AudioListener(private val host: String, private val status: (String) -> Un
                 val played = player.playbackHeadPosition.toLong() and 0xffffffffL
                 val queuedFrames = (writtenFrames - played).coerceAtLeast(0)
                 val queuedNs = queuedFrames * 1_000_000_000L / AudioPacket.RATE
-                if (queuedNs > 40_000_000) { delay(2); continue }
+                if (queuedNs > queueLimitNs) { delay(2); continue }
                 val frame = jitter.poll(now, if (clock.ready(now)) clock.offsetNs else null, queuedNs)
                 if (frame == null) { delay(2); continue }
                 if (frame.reset) resetFade = true
@@ -128,7 +150,7 @@ class AudioListener(private val host: String, private val status: (String) -> Un
                 if (now - lastStatus > 1_000_000_000L) {
                     val age = frame.packet?.let { (now + clock.offsetNs - it.captureNs + queuedNs) / 1_000_000 }
                     val uncertainty = if (clock.ready(now)) "±${clock.roundTripNs/2/1_000_000} ms" else "clock stale"
-                    status("PCM v2 • 768 kbps • packets $received • invalid $invalid\nBuffer ${jitter.targetMs} ms / ${jitter.depth()} packets • jitter ${"%.1f".format(jitter.jitterMs())} ms\nDrops ${jitter.dropped} • late ${jitter.late} • missing ${jitter.underruns} • output underruns ${player.underrunCount} • resync ${jitter.resyncs}\nEstimated captured-to-enqueued-output age ${age ?: "—"} ms $uncertainty; excludes acoustic/device delay\nAudioTrack queued ${queuedNs/1_000_000} ms • presentation $presentation")
+                    status("PCM v2 • 768 kbps • packets ${received.get()} • invalid ${invalid.get()}\nBuffer ${jitter.targetMs} ms / ${jitter.depth()} packets • jitter ${"%.1f".format(jitter.jitterMs())} ms\nDrops ${jitter.dropped} • late ${jitter.late} • missing ${jitter.underruns} • output underruns ${player.underrunCount} • resync ${jitter.resyncs}\nEstimated captured-to-enqueued-output age ${age ?: "—"} ms $uncertainty; excludes acoustic/device delay\nCapture-to-receive estimate ${networkAgeNs.get()/1_000_000} ms • packet decode ${decodeNs.get()/maxOf(1,received.get())/1000} µs\nAudioTrack queued ${queuedNs/1_000_000} ms • buffer ${player.bufferSizeInFrames} frames • presentation $presentation")
                     lastStatus = now
                 }
             }
@@ -136,7 +158,7 @@ class AudioListener(private val host: String, private val status: (String) -> Un
             // Cancel child receivers by closing blocking sockets before coroutineScope awaits them.
             coroutineContext.cancelChildren(); socket.close(); tcp.close()
             try { player.pause(); player.flush() } catch (_: Exception) { }
-            player.release(); track = null
+            track = null; player.release()
         }
     }
     fun stop() {

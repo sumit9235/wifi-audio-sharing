@@ -21,6 +21,10 @@ data class AudioPacket(val session: Long, val stream: Int, val sequence: Int,
         const val RATE = 48000
         const val PCM_BYTES = SAMPLES * 2
         const val FRAME_NS = 10_000_000L
+        fun legacy(sequence: Int, pcm: ByteArray): ByteArray {
+            require(pcm.size == PCM_BYTES)
+            return ByteBuffer.allocate(4 + pcm.size).putInt(sequence).put(pcm).array()
+        }
         fun decode(bytes: ByteArray, length: Int = bytes.size): AudioPacket? {
             if (length != HEADER + PCM_BYTES || length > bytes.size) return null
             val b = ByteBuffer.wrap(bytes, 0, length).order(ByteOrder.BIG_ENDIAN)

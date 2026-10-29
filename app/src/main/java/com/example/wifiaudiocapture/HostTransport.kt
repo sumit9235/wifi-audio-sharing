@@ -10,7 +10,12 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicLong
 
 /** Reliable bounded control; independent bounded UDP senders; capture never sends. */
-class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) : AutoCloseable {
+class HostTransport(val legacy: Boolean, private val status: (String) -> Unit,
+                    private val approve: suspend (String, String) -> Boolean = { _, _ -> false },
+                    private val roster: (List<String>) -> Unit = {},
+                    private val network: android.net.Network? = null, private val bindAddress: InetAddress? = null,
+                    private val controlPort: Int = ControlProtocol.PORT,
+                    private val allowPeer: (InetAddress) -> Boolean = ::local) : AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val session = SecureRandom().nextLong().let { if (it == 0L) 1L else it }
     val stream = SecureRandom().nextInt()
@@ -23,10 +28,10 @@ class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) :
     private var server: ServerSocket? = null
     val drops: Long get() = dropCounter.get()
     val count: Int get() = clients.size
-    val advertisedPort: Int get() = if (legacy) CaptureService.PORT else ControlProtocol.PORT
+    val advertisedPort: Int get() = if (legacy) CaptureService.PORT else (server?.localPort ?: controlPort)
     private inner class Peer(val address: SocketAddress, val name: String) : AutoCloseable {
         private val queue = Channel<ByteArray>(8, BufferOverflow.DROP_OLDEST, onUndeliveredElement = { dropCounter.incrementAndGet() })
-        private val sender = if (legacy) null else DatagramSocket()
+        private val sender = if (legacy) null else DatagramSocket().apply { network?.bindSocket(this) }
         private val job = scope.launch {
             for (bytes in queue) {
                 try { (sender ?: udp)?.send(DatagramPacket(bytes, bytes.size, address)) }
@@ -39,14 +44,14 @@ class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) :
     init {
         try {
             if (legacy) {
-                udp = DatagramSocket(CaptureService.PORT).apply { soTimeout = 1000 }
+                udp = DatagramSocket(InetSocketAddress(bindAddress, CaptureService.PORT)).apply { soTimeout = 1000; network?.bindSocket(this) }
                 scope.launch { legacyJoins() }
             } else {
-                server = ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(ControlProtocol.PORT), 8) }
+                server = ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(bindAddress, controlPort), 8) }
                 scope.launch {
                     while (isActive) {
                         val client = try { server!!.accept() } catch (_: Exception) { break }
-                        if (!local(client.inetAddress) || !slots.tryAcquire()) { client.close(); continue }
+                        if (!allowPeer(client.inetAddress) || !slots.tryAcquire()) { client.close(); continue }
                         connections.add(client)
                         launch { try { handle(client) } finally { connections.remove(client); client.close(); slots.release() } }
                     }
@@ -63,6 +68,7 @@ class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) :
             ControlProtocol.write(output, "SESSION 2 $session $stream PCM16 48000 1")
             val join = ControlProtocol.parseJoin(ControlProtocol.read(input)) ?: error("Incompatible join")
             require(join.session == session) { "Stale session. Refresh nearby sessions." }
+            require(approve(join.name, client.inetAddress.hostAddress ?: "LAN peer")) { "Host declined or approval timed out. Ask the host and retry" }
             synchronized(clients) {
                 require(clients.size < ControlProtocol.MAX_PEERS) { "Room full (5 listeners)" }
                 val address = InetSocketAddress(client.inetAddress, join.port)
@@ -90,7 +96,7 @@ class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) :
         while (currentCoroutineContext().isActive) {
             try {
                 val packet = DatagramPacket(bytes, bytes.size); udp!!.receive(packet)
-                if (!local(packet.address)) continue
+                if (!allowPeer(packet.address)) continue
                 when (String(packet.data, packet.offset, packet.length, Charsets.US_ASCII)) {
                     "JOIN_WIFI_AUDIO_V1" -> if (registry.join(packet.socketAddress, android.os.SystemClock.elapsedRealtime())) {
                         clients.computeIfAbsent(packet.socketAddress) { Peer(it, "Legacy listener") }
@@ -103,11 +109,11 @@ class HostTransport(val legacy: Boolean, private val status: (String) -> Unit) :
         }
     }
     fun publish(pcm: ByteArray, sequence: Int, mediaSample: Long, captureNs: Long) {
-        val bytes = if (legacy) java.nio.ByteBuffer.allocate(4 + pcm.size).putInt(sequence).put(pcm).array()
+        val bytes = if (legacy) AudioPacket.legacy(sequence, pcm)
                     else AudioPacket(session, stream, sequence, mediaSample, captureNs, pcm).encode()
         clients.values.forEach { it.offer(bytes) }
     }
-    private fun report() = status("Sharing • ${clients.size}/5 listeners • ${if (legacy) "Phase 2 PCM" else "PCM v2"} • sender drops $drops")
+    private fun report() { roster(clients.values.map { it.name }); if (legacy) status("Sharing • ${clients.size}/5 listeners • Phase 2 PCM • sender drops $drops") }
     override fun close() {
         scope.cancel(); server?.close(); udp?.close()
         connections.forEach { try { it.close() } catch (_: Exception) { } }; connections.clear()

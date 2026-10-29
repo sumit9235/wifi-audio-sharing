@@ -78,3 +78,26 @@ numbers must not be labeled actual speaker-to-speaker latency.
 
 Latency goals <250 ms and <=100 ms listener alignment are pending physical
 measurement. Buffer tuning is not proof that these goals have been achieved.
+
+## Phase 5 authorization and lifecycle
+
+Normal joins are explicitly approved on the host screen after HELLO; up to three
+pending requests expire at 30 s. Listener waits up to 35 s for WELCOME, then uses
+a 6 s control timeout. Stopping closes pending approvals and all connections.
+There is no reusable pairing PIN or stored invitation. Approval limits who is
+sent audio, but passive LAN interception and packet injection are not prevented;
+use a trusted LAN. Host identity is not cryptographically verified.
+
+Both roles own foreground services with immediate notification stop actions.
+Listeners request audio focus after entering a mediaPlayback FGS (needed when
+targeting Android 15), and disconnect on focus loss or noisy-route events. Hosts
+do not request focus from the music source. Wi-Fi routing is explicit when a
+Wi-Fi Network is available; servers bind its IPv4 interface. Hotspot scenarios
+without a platform Wi-Fi Network fall back to private-address interface routing
+and need on-device verification. No silent capture restart/re-consent occurs.
+
+For Android 10/11, listener target latency also accommodates the effective
+AudioTrack startup buffer. An unusually large minimum output buffer fails with
+a suggestion to use a different route or compatibility mode, rather than waiting
+forever or inserting audio for frames not yet captured. Hardware buffer size is
+included in diagnostics. Android 12+ requests a one-frame start threshold.

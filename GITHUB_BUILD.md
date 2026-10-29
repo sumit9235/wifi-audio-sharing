@@ -1,40 +1,51 @@
-# Build APK without Android Studio
+# Build and download the APK
 
-This repository includes `.github/workflows/build-apk.yml`, which builds an installable **debug APK** using GitHub Actions.
+Android Studio is not required. The repository includes a pinned Gradle wrapper
+and `.github/workflows/build-apk.yml`. Pushes to main/master, pull requests and
+manual workflow dispatch run unit tests, Android lint and assemble an installable
+debug APK with JDK 17/SDK 35.
 
-## Upload to GitHub from Ubuntu
+1. Open https://github.com/sumit9235/wifi-audio-sharing/actions/workflows/build-apk.yml.
+2. Select **Build Android APK → Run workflow** or open the latest successful push.
+3. Under **Artifacts**, download **WifiAudioSharing-debug-apk** (14-day retention).
+4. Unzip and install `app-debug.apk` on all phones. Match APKs and stream modes.
+5. `WifiAudioSharing-verification` contains unit-test XML/HTML and lint reports.
 
-1. Extract this ZIP on Ubuntu.
-2. Create a new empty GitHub repository (do not initialize with README).
-3. In a terminal, run these commands from **inside** the extracted project folder:
+Local APK path: `app/build/outputs/apk/debug/app-debug.apk`.
+A clean CI runner uses a new debug signing key. If an update fails signature
+validation, uninstall the previous debug build before installing the new one.
+Uninstalling clears local display/volume/profile settings.
+
+## Safely push future work
+
+The GitHub remote is already configured. Do not reinitialize the repository.
+If GitHub contains newer commits, integrate them before pushing:
 
 ```bash
-git init
-git branch -M main
-git add .
-git commit -m "Initial Android audio capture test"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
-git push -u origin main
+git pull --no-rebase origin main
+# Resolve any reported conflicts, inspect the result and commit it.
+git push origin main
 ```
 
-GitHub may prompt you to authenticate. Replace the example URL with your repository address. If you already have a nonempty repository, create a fresh one to avoid conflicts.
+Authenticate with a GitHub credential manager, SSH key or access token. Never
+paste account passwords/tokens into source files, remote URLs or chat.
 
-## Download APK
+## Signed release APK later
 
-1. Open the repository on GitHub.
-2. Select **Actions** > **Build Android APK**.
-3. Click the most recent run (wait until it completes successfully).
-4. Under **Artifacts**, download `WifiAudioCapture-Phase1-debug-apk`.
-5. Unzip the artifact and transfer `app-debug.apk` to your phone.
-6. Install the APK. Android may ask you to allow installations from that source.
+The debug APK is for testing. For stable distributed upgrades:
 
-## Run the test
+1. Generate a dedicated release signing key on a trusted machine. Keep encrypted
+   offline backups. Never commit the keystore, passwords or key material.
+2. Store a base64 keystore and its alias/passwords in protected GitHub Actions
+   environment secrets, with release approvals and limited repository access.
+3. Add an opt-in release job (tag/manual dispatch). Decode the keystore into a
+   runner temporary directory with restrictive permissions and read signing
+   credentials from environment variables in a release signingConfig. Do not
+   echo them, pass them in logged command arguments or upload the keystore.
+4. Run tests/lint and `:app:assembleRelease`, then verify with Android
+   `apksigner verify --verbose`. Publish only the signed APK and checksum.
+5. Reuse the same protected signing key for every update and increment
+   versionCode. A debug-signed app must be uninstalled before switching keys.
 
-Play music in ReVanced, start a 10-second recording in the test app, approve Android capture permission, then play the WAV sample in the app. A system screen recorder working is not a guarantee third-party capture works.
-
-## Notes
-
-- This is Phase 1 only; there is **no Wi-Fi broadcast** yet.
-- The APK is signed automatically with Android's debug key; intended only for personal testing.
-- Requires Android 10 (API 29) or later.
-- Actual APK compilation and device recording have **not** been verified in this environment.
+Release signing is intentionally not configured until a private key and secure
+release environment exist. No signing credentials are included in this repo.

@@ -45,3 +45,28 @@ route (speaker/wired/Bluetooth), power saver and Wi-Fi signal for every run.
 
 No latency, discovery timing, drift, screen-lock or battery claim is accepted
 until this record contains observed numbers. Targets are not measurements.
+
+## Exact phone-count runs and measurements to fill in
+
+| Run | Host | Listeners | Required checks |
+|---|---|---|---|
+| Two phones total | 1 | 1 | discovery, approval, audible audio, manual-IP fallback, notification stop |
+| Three phones total | 1 | 2 | simultaneous playback, one leaves/rejoins, other uninterrupted |
+| Full initial acceptance (four phones total) | 1 | 3 | three simultaneous listeners for 15 minutes, bounded memory/delay |
+| Optional capacity (six phones total) | 1 | 5 | stable home-Wi-Fi playback and a sixth listener rejected |
+
+Three listeners means four phones including the host. A three-phone test alone
+does not establish three-listener capacity.
+
+| Metric | Phase 2 compatibility | Optimized PCM | Evidence |
+|---|---|---|---|
+| Discovery time | N/A, manual IP | pending | stopwatch, router and phone models |
+| Capture-to-output median / p95 | pending | pending | external acoustic recording, same route |
+| Pairwise listener offset median / p95 | pending | pending | external recording of all outputs |
+| Delay change from minute 1 to minute 15 | pending | pending | recorded transients + diagnostics |
+| Drops, late packets, underruns, max queue depth | pending | pending | diagnostics each minute |
+| Memory start/end and audible artifacts | pending | pending | device profiler + listening notes |
+| Host/listener screen lock | baseline not supplied | pending | model, Android version, duration |
+
+Emulator/unit/loopback results belong in VALIDATION.md, not in these physical
+measurement cells.
