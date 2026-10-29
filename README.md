@@ -1,2 +1,2 @@
-# local_music_broadcasting_system
+# wifi-audio-sharing
 this is just a testing applcaition
