@@ -1,36 +1,24 @@
-# Wi-Fi Music Sharing - Phase 1: Android internal-audio capture test
+# Wi-Fi Music Sharing — Phase 2 (Android 10+)
 
-This is a testing application for the `wifi-audio-sharing` project.
+A single Android app with **Host** and **Listener** modes, built on the previously tested AudioPlaybackCapture API.
 
-This is a **source project**, not a built APK. It tests whether ordinary Android APIs can capture YouTube ReVanced playback, without using the microphone. **No Wi-Fi streaming has been implemented yet.**
+## Build without Android Studio
 
-## Requirements
-- Android 10 (API 29) or later phone
-- Android Studio with Android SDK 35 and JDK 17
-- Gradle 8.13, Android Gradle Plugin 8.13.2, Kotlin 2.2.21
+Upload all folders (including `.github`) to the **root** of your existing GitHub repository on branch `main`. Open **Actions -> Build Android APK**, run it, and download artifact `WifiAudioSharing-Phase2-debug-apk` after a successful build. The ZIP artifact contains `app-debug.apk`.
 
-## Build and run
-1. Open the `WifiAudioCapturePhase1` folder in Android Studio.
-2. Let Android Studio sync Gradle and install SDK dependencies as needed.
-3. Select a physical Android device, enable USB debugging, and run `app`.
-4. Play music using ReVanced; return to this app and press **Record 10 seconds**.
-5. Grant `RECORD_AUDIO` (required by Android even though this app does **not** record the microphone) and approve the Android screen capture prompt.
-6. While recording, return to ReVanced and keep the song playing.
-7. Return to the capture app; press **Listen to saved sample**. If the result says silent, ReVanced may not permit third-party playback capture. System screen recording working does not guarantee this test will work.
+Keep `app/`, `settings.gradle.kts`, `build.gradle.kts`, and `gradle/` in the repository root; a workflow YAML alone does not build an app.
 
-## File output
-App-specific external music directory: `Android/data/com.example.wifiaudiocapture/files/Music/revanced-capture.wav` (modern Android file managers may hide this path). `Listen` plays it in-app.
+## Test on two phones
 
-## Architecture
-MainActivity -> MediaProjection consent -> mediaProjection foreground service -> AudioPlaybackCaptureConfiguration -> AudioRecord (48 kHz mono PCM16) -> 10-second WAV + RMS level.
+1. Install the same Phase 2 APK on both phones. Put both on the same Wi-Fi (not a guest/isolated network).
+2. On the music phone, open app, note **Host local IP**, and tap **Start live sharing**; grant Android playback capture permission. Return to ReVanced and play a song.
+3. On a friend's phone, open app, enter the music phone's displayed IP, and tap **Join and listen**. Connect headphones.
+4. Stop with the in-app buttons; the host also shows a foreground-service notification.
 
-## Security and limitations
-- On Android, capturing media depends on the *source application's* capture policy. This sample never bypasses such a policy.
-- Consent is needed for every new MediaProjection session on recent Android versions.
-- Captures all eligible media/game playback in the profile during the 10-second interval, not exclusively ReVanced; close other audio apps for a clean test.
-- Recording remains on-device in an app-specific directory. No upload or networking.
-- One active capture at a time. Designed as a feasibility test, not production code.
-- Recording media you do not own or have rights to redistribute may be restricted by copyright and service terms.
+## Implementation / limitations
 
-## Next milestone
-Only after you verify audible playback in this APK, we can implement LAN discovery, Opus encoding, UDP audio sender/receiver, buffering, and synchronization.
+- Audio is 48-kHz, mono, 16-bit **raw PCM** over local UDP port 39555, 10-ms chunks (< MTU). Approximate payload bitrate: **768 kbps per listener**. No server or internet necessary, but Wi-Fi must allow peer traffic.
+- The host uses AudioPlaybackCapture with explicit user consent. ReVanced must still allow capture; Phase 1 success on the same phone is encouraging.
+- **Prototype**: manual IP connection, no encryption/authentication, no adaptive jitter buffer, no tight sync, no auto-discovery, and no codec compression. Use only on a Wi-Fi network you trust, and only for audio you are authorized to retransmit.
+- Android may change local IP when changing networks. Battery optimization can terminate background work. Audio stream currently plays only while the listener app remains alive.
+- Run two-phone testing first; report phone Android versions plus build/runtime errors if any.

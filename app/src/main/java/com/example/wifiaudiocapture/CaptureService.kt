@@ -7,145 +7,142 @@ import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
-import java.io.File
-import java.io.FileOutputStream
-import java.io.RandomAccessFile
+import java.net.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.sqrt
 
 class CaptureService : Service() {
     companion object {
         const val START_ACTION = "com.example.wifiaudiocapture.START"
         const val STOP_ACTION = "com.example.wifiaudiocapture.STOP"
         const val RESULT_ACTION = "com.example.wifiaudiocapture.RESULT"
-        private const val CHANNEL = "capture"
+        const val PORT = 39555
+        const val SAMPLE_RATE = 48000
+        const val SAMPLES_PER_PACKET = 480 // 10 ms mono PCM, < MTU
+        private const val CHANNEL = "share_audio"
     }
+
     private var projection: MediaProjection? = null
-    private var recorder: AudioRecord? = null
-    private var worker: Thread? = null
+    private var record: AudioRecord? = null
+    private var socket: DatagramSocket? = null
+    private var captureThread: Thread? = null
+    private var registrationThread: Thread? = null
     private val running = AtomicBoolean(false)
-    private val sampleRate = 48000
+    private val clients = ConcurrentHashMap<SocketAddress, Long>()
 
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
-            NotificationChannel(CHANNEL, "Audio capture test", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL, "Live audio sharing", NotificationManager.IMPORTANCE_LOW)
         )
     }
+
+    @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == STOP_ACTION) {
-            running.set(false)
-            if (worker == null) stopSelf()
-            return START_NOT_STICKY
-        }
+        if (intent?.action == STOP_ACTION) { stopSharing(); stopSelf(); return START_NOT_STICKY }
         if (intent?.action != START_ACTION || running.get()) return START_NOT_STICKY
         val notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle("Audio capture test")
-            .setContentText("Recording internal playback for up to 10 seconds")
+            .setContentTitle("Wi-Fi Music Sharing")
+            .setContentText("Broadcasting playback audio to your local Wi-Fi")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .build()
         startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         val code = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
-        @Suppress("DEPRECATION") val data = if (Build.VERSION.SDK_INT >= 33)
-            intent.getParcelableExtra("resultData", Intent::class.java)
-        else intent.getParcelableExtra("resultData") as? Intent
+        val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("resultData", Intent::class.java)
+            else intent.getParcelableExtra("resultData") as? Intent
         if (code != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
         try {
-            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = mgr.getMediaProjection(code, data)
+            socket = DatagramSocket(PORT).apply { soTimeout = 1000 }
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(code, data)
             projection!!.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() { running.set(false) }
+                override fun onStop() { stopSharing(); stopSelf() }
             }, Handler(Looper.getMainLooper()))
             val config = AudioPlaybackCaptureConfiguration.Builder(projection!!)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
-            val minBuffer = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            require(minBuffer > 0) { "AudioRecord buffer not supported" }
-            recorder = AudioRecord.Builder()
-                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
-                .setBufferSizeInBytes(maxOf(minBuffer * 2, 8192))
+            val format = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
+            val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            require(minBuffer > 0)
+            record = AudioRecord.Builder().setAudioFormat(format)
                 .setAudioPlaybackCaptureConfig(config)
-                .build()
-            require(recorder!!.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
+                .setBufferSizeInBytes(maxOf(minBuffer * 2, 8192)).build()
+            require(record!!.state == AudioRecord.STATE_INITIALIZED)
             running.set(true)
-            worker = Thread { capture() }.apply { start() }
+            registrationThread = Thread({ registerListeners() }, "wifi-client-register").apply { start() }
+            captureThread = Thread({ streamAudio() }, "wifi-audio-capture").apply { start() }
+            message("Broadcasting on port $PORT. Friends can join using your host IP.")
         } catch (e: Exception) {
-            broadcast("Capture error: ${e.message}", "")
-            cleanup()
-            stopSelf()
+            message("Host failed: ${e.message}")
+            stopSharing(); stopSelf()
         }
         return START_NOT_STICKY
     }
-    private fun capture() {
-        val file = File(getExternalFilesDir(android.os.Environment.DIRECTORY_MUSIC), "revanced-capture.wav")
-        var written = 0L
-        var energy = 0.0
-        var count = 0L
-        var error: String? = null
+
+    private fun registerListeners() {
+        val buf = ByteArray(40)
+        while (running.get()) {
+            try {
+                val p = DatagramPacket(buf, buf.size)
+                socket?.receive(p)
+                val command = String(p.data, p.offset, p.length, Charsets.US_ASCII)
+                if (command == "JOIN_WIFI_AUDIO_V1") clients[p.socketAddress] = SystemClock.elapsedRealtime()
+                if (command == "LEAVE_WIFI_AUDIO_V1") clients.remove(p.socketAddress)
+            } catch (_: SocketTimeoutException) {
+            } catch (_: Exception) { if (!running.get()) break }
+        }
+    }
+
+    private fun streamAudio() {
         try {
-            val audio = recorder ?: kotlin.error("Recorder unavailable")
+            val audio = record ?: return
             audio.startRecording()
-            FileOutputStream(file).use { out ->
-                out.write(ByteArray(44))
-                val samples = ShortArray(4096)
-                val until = SystemClock.elapsedRealtime() + 10_000L
-                while (running.get() && SystemClock.elapsedRealtime() < until) {
-                    val n = audio.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
-                    if (n < 0) kotlin.error("AudioRecord read error $n")
-                    if (n == 0) continue
-                    val bytes = ByteArray(n * 2)
-                    for (i in 0 until n) {
-                        val v = samples[i].toInt()
-                        bytes[i * 2] = (v and 255).toByte()
-                        bytes[i * 2 + 1] = ((v shr 8) and 255).toByte()
-                        energy += v.toDouble() * v
-                    }
-                    count += n
-                    out.write(bytes)
-                    written += bytes.size
+            val samples = ShortArray(SAMPLES_PER_PACKET)
+            var seq = 0
+            while (running.get()) {
+                var count = 0
+                while (count < samples.size && running.get()) {
+                    val n = audio.read(samples, count, samples.size - count, AudioRecord.READ_BLOCKING)
+                    if (n < 0) error("AudioRecord read error $n")
+                    if (n > 0) count += n
+                }
+                if (count != samples.size) continue
+                val bytes = ByteArray(4 + count * 2)
+                bytes[0] = (seq ushr 24).toByte()
+                bytes[1] = (seq ushr 16).toByte()
+                bytes[2] = (seq ushr 8).toByte()
+                bytes[3] = seq.toByte()
+                for (i in samples.indices) {
+                    bytes[4 + i * 2] = samples[i].toByte()
+                    bytes[5 + i * 2] = (samples[i].toInt() ushr 8).toByte()
+                }
+                seq++
+                val now = SystemClock.elapsedRealtime()
+                clients.entries.forEach { (addr, lastSeen) ->
+                    if (now - lastSeen > 6000) clients.remove(addr)
+                    else try { socket?.send(DatagramPacket(bytes, bytes.size, addr)) } catch (_: Exception) {}
                 }
             }
-            writeWavHeader(file, written)
-        } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
-        finally {
-            running.set(false)
-            val rms = if (count > 0) sqrt(energy / count) / 32768.0 else 0.0
-            val assessment = when {
-                error != null -> "Recording failed: $error"
-                written == 0L -> "No samples received."
-                rms < 0.0002 -> "Recorded ${written / 1024} KB, but nearly silent (RMS ${"%.5f".format(rms)}). Source capture may be blocked."
-                else -> "Recorded ${written / 1024} KB. Audio present (RMS ${"%.5f".format(rms)}). Tap Listen to verify."
-            }
-            broadcast(assessment, file.absolutePath)
-            cleanup()
-            stopSelf()
-        }
+        } catch (e: Exception) { message("Audio stopped: ${e.message}") }
+        finally { stopSharing(); stopSelf() }
     }
-    private fun broadcast(message: String, path: String) {
-        sendBroadcast(Intent(RESULT_ACTION).setPackage(packageName).putExtra("message", message).putExtra("path", path))
+
+    private fun message(value: String) {
+        sendBroadcast(Intent(RESULT_ACTION).setPackage(packageName).putExtra("message", value))
     }
-    private fun cleanup() {
-        try { recorder?.stop() } catch (_: Exception) {}
-        recorder?.release(); recorder = null
+    private fun stopSharing() {
+        if (!running.getAndSet(false) && record == null && socket == null) return
+        socket?.close(); socket = null
+        try { record?.stop() } catch (_: Exception) {}
+        record?.release(); record = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        worker = null
+        clients.clear()
     }
-    private fun writeWavHeader(file: File, dataLength: Long) {
-        RandomAccessFile(file, "rw").use { f ->
-            fun ascii(s: String) { f.write(s.toByteArray(Charsets.US_ASCII)) }
-            fun le16(n: Int) { f.write(n and 255); f.write((n shr 8) and 255) }
-            fun le32(n: Long) { repeat(4) { f.write(((n shr (it * 8)) and 255).toInt()) } }
-            ascii("RIFF"); le32(dataLength + 36); ascii("WAVE")
-            ascii("fmt "); le32(16); le16(1); le16(1); le32(sampleRate.toLong())
-            le32(sampleRate.toLong() * 2); le16(2); le16(16)
-            ascii("data"); le32(dataLength)
-        }
-    }
-    override fun onDestroy() { running.set(false); super.onDestroy() }
+    override fun onDestroy() { stopSharing(); super.onDestroy() }
 }
