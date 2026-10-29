@@ -27,9 +27,7 @@ class CaptureService : Service() {
     private var transport: HostTransport? = null
     private var discovery: SessionDiscovery? = null
     private var captureThread: Thread? = null
-    private var registrationThread: Thread? = null
     private val running = AtomicBoolean(false)
-    private val clients = ConcurrentHashMap<SocketAddress, Long>()
 
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
@@ -55,7 +53,7 @@ class CaptureService : Service() {
             else intent.getParcelableExtra("resultData") as? Intent
         if (code != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
         try {
-            transport = HostTransport(::message)
+            transport = HostTransport(intent.getBooleanExtra("legacy", false), ::message)
             val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(code, data)
             projection!!.registerCallback(object : MediaProjection.Callback() {
@@ -75,9 +73,9 @@ class CaptureService : Service() {
                 .setBufferSizeInBytes(maxOf(minBuffer * 2, 8192)).build()
             require(record!!.state == AudioRecord.STATE_INITIALIZED)
             running.set(true)
-            discovery = SessionDiscovery(this, {}, ::message).also { it.advertise(Build.MODEL) }
+            discovery = SessionDiscovery(this, {}, ::message).also { it.advertise(Build.MODEL, transport!!.advertisedPort) }
             captureThread = Thread({ streamAudio() }, "wifi-audio-capture").apply { start() }
-            message("Broadcasting on port $PORT. Friends can join using your host IP.")
+            message("Sharing started. Find this session nearby or join by IP.")
         } catch (e: Exception) {
             message("Host failed: ${e.message}")
             stopSharing(); stopSelf()
@@ -91,6 +89,10 @@ class CaptureService : Service() {
             audio.startRecording()
             val samples = ShortArray(SAMPLES_PER_PACKET)
             var seq = 0
+            var mediaSample = 0L
+            val timestamp = AudioTimestamp()
+            var timestampValid = false
+            var stampAt = 0L
             while (running.get()) {
                 var count = 0
                 while (count < samples.size && running.get()) {
@@ -99,17 +101,21 @@ class CaptureService : Service() {
                     if (n > 0) count += n
                 }
                 if (count != samples.size) continue
-                val bytes = ByteArray(4 + count * 2)
-                bytes[0] = (seq ushr 24).toByte()
-                bytes[1] = (seq ushr 16).toByte()
-                bytes[2] = (seq ushr 8).toByte()
-                bytes[3] = seq.toByte()
+                val pcm = ByteArray(count * 2)
                 for (i in samples.indices) {
-                    bytes[4 + i * 2] = samples[i].toByte()
-                    bytes[5 + i * 2] = (samples[i].toInt() ushr 8).toByte()
+                    pcm[i * 2] = samples[i].toByte()
+                    pcm[i * 2 + 1] = (samples[i].toInt() ushr 8).toByte()
                 }
-                seq++
-                transport?.publish(bytes)
+                val now = System.nanoTime()
+                if (now - stampAt > 1_000_000_000L) {
+                    timestampValid = audio.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS
+                    stampAt = now
+                }
+                val captureNs = if (timestampValid) timestamp.nanoTime +
+                    (mediaSample - timestamp.framePosition) * 1_000_000_000L / SAMPLE_RATE
+                    else now - AudioPacket.FRAME_NS
+                transport?.publish(pcm, seq++, mediaSample, captureNs.coerceAtLeast(0))
+                mediaSample += count
             }
         } catch (e: Exception) { message("Audio stopped: ${e.message}") }
         finally { stopSharing(); stopSelf() }
@@ -126,7 +132,6 @@ class CaptureService : Service() {
         record?.release(); record = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        clients.clear()
     }
     override fun onDestroy() { stopSharing(); super.onDestroy() }
 }

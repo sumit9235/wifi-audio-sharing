@@ -17,7 +17,7 @@ import java.util.ArrayDeque
 class SessionDiscovery(context: Context, private val changed: (List<Session>) -> Unit,
                        private val status: (String) -> Unit) : AutoCloseable {
     data class Session(val name: String, val host: String, val port: Int)
-    companion object { const val TYPE = "_wifiaudio._udp." }
+    companion object { const val TYPE = "_wifiaudio._tcp." }
     private val nsd = context.getSystemService(NsdManager::class.java)
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val main = Handler(Looper.getMainLooper())
@@ -49,9 +49,9 @@ class SessionDiscovery(context: Context, private val changed: (List<Session>) ->
         registration = listener
         val info = NsdServiceInfo().apply {
             serviceName = "Wi-Fi Audio ${name.take(24)}"
-            serviceType = TYPE
+            serviceType = if (port == CaptureService.PORT) "_wifiaudio._udp." else TYPE
             this.port = port
-            setAttribute("version", "1")
+            setAttribute("version", if (port == CaptureService.PORT) "1" else "2")
         }
         try { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
         catch (e: Exception) { status("Discovery unavailable: ${e.message}. Join by IP.") }

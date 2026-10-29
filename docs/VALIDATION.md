@@ -11,3 +11,15 @@
   the new real TCP control endpoint instead.
 - Three/five-phone capacity, NSD timing, Wi-Fi changes: physical tests pending.
 - GitHub Actions workflow updated to run tests before publishing the debug APK.
+
+## Phase 4
+
+- Local `:app:testDebugUnitTest :app:assembleDebug`: PASS (7 JUnit tests).
+- Packet/header bounds, sequence wrap, reorder/duplicates/loss, clock validation,
+  join compatibility, registry and 90,000-frame synthetic 15-minute trace PASS.
+- Synthetic test checks queue capacity and continued playout, not Android output,
+  CPU, real network stability or acoustic latency.
+- Installable APK: `/tmp/wifi-audio-tools/phase4-debug.apk`.
+- Phase 3 GitHub Actions: PASS, run 40868436697.
+- No physical Phase 4 measurements yet. Opus/stereo deferred; PCM tradeoffs and
+  estimated latency semantics documented in PROTOCOL.md.

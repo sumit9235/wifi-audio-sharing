@@ -18,6 +18,7 @@ class MainActivity : Activity() {
     private var listener: AudioListener? = null
     private lateinit var discovery: SessionDiscovery
     private lateinit var sessions: LinearLayout
+    private lateinit var legacyMode: CheckBox
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -39,8 +40,10 @@ class MainActivity : Activity() {
             textSize = size
             setPadding(0, 0, 0, 14)
         }
-        root.addView(text("Wi-Fi Music Sharing — Phase 3", 23f))
+        root.addView(text("Wi-Fi Music Sharing — Phase 4", 23f))
         root.addView(text("Both phones must use the same Wi-Fi. The host plays music in ReVanced. Only share audio you have permission to distribute.", 14f))
+        legacyMode = CheckBox(this).apply { text = "Phase 2 compatibility (manual IP, trusted LAN only)" }
+        root.addView(legacyMode)
         root.addView(text("HOST (music phone)", 18f))
         root.addView(text("Host local IP: ${localIpv4() ?: "Not found — connect to Wi-Fi"}", 15f))
         root.addView(Button(this).apply { text = "Start live sharing"; setOnClickListener { initiateHost() } })
@@ -103,6 +106,7 @@ class MainActivity : Activity() {
         if (resultCode != RESULT_OK || data == null) { status.text = "Capture permission denied"; return }
         startForegroundService(Intent(this, CaptureService::class.java).apply {
             action = CaptureService.START_ACTION
+            putExtra("legacy", legacyMode.isChecked)
             putExtra("resultCode", resultCode)
             putExtra("resultData", data)
         })
@@ -113,7 +117,7 @@ class MainActivity : Activity() {
         val host = ipInput.text.toString().trim()
         if (host.isEmpty()) { status.text = "Enter the host phone's Wi-Fi IP"; return }
         listener?.stop()
-        listener = AudioListener(host) { message -> runOnUiThread { status.text = message } }.also { it.start() }
+        listener = AudioListener(host, { message -> runOnUiThread { status.text = message } }, legacyMode.isChecked).also { it.start() }
         status.text = "Connecting to $host ..."
     }
 
