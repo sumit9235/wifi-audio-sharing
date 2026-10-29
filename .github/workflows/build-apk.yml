@@ -3,6 +3,7 @@ name: Build Android APK
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches: [main, master]
 
@@ -27,13 +28,13 @@ jobs:
         with:
           gradle-version: '8.13'
 
-      - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Test and build debug APK
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
 
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: WifiAudioCapture-Phase1-debug-apk
+          name: WifiAudioSharing-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14

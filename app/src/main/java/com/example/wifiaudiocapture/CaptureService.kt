@@ -24,7 +24,8 @@ class CaptureService : Service() {
 
     private var projection: MediaProjection? = null
     private var record: AudioRecord? = null
-    private var socket: DatagramSocket? = null
+    private var transport: HostTransport? = null
+    private var discovery: SessionDiscovery? = null
     private var captureThread: Thread? = null
     private var registrationThread: Thread? = null
     private val running = AtomicBoolean(false)
@@ -54,7 +55,7 @@ class CaptureService : Service() {
             else intent.getParcelableExtra("resultData") as? Intent
         if (code != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
         try {
-            socket = DatagramSocket(PORT).apply { soTimeout = 1000 }
+            transport = HostTransport(::message)
             val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(code, data)
             projection!!.registerCallback(object : MediaProjection.Callback() {
@@ -74,7 +75,7 @@ class CaptureService : Service() {
                 .setBufferSizeInBytes(maxOf(minBuffer * 2, 8192)).build()
             require(record!!.state == AudioRecord.STATE_INITIALIZED)
             running.set(true)
-            registrationThread = Thread({ registerListeners() }, "wifi-client-register").apply { start() }
+            discovery = SessionDiscovery(this, {}, ::message).also { it.advertise(Build.MODEL) }
             captureThread = Thread({ streamAudio() }, "wifi-audio-capture").apply { start() }
             message("Broadcasting on port $PORT. Friends can join using your host IP.")
         } catch (e: Exception) {
@@ -82,20 +83,6 @@ class CaptureService : Service() {
             stopSharing(); stopSelf()
         }
         return START_NOT_STICKY
-    }
-
-    private fun registerListeners() {
-        val buf = ByteArray(40)
-        while (running.get()) {
-            try {
-                val p = DatagramPacket(buf, buf.size)
-                socket?.receive(p)
-                val command = String(p.data, p.offset, p.length, Charsets.US_ASCII)
-                if (command == "JOIN_WIFI_AUDIO_V1") clients[p.socketAddress] = SystemClock.elapsedRealtime()
-                if (command == "LEAVE_WIFI_AUDIO_V1") clients.remove(p.socketAddress)
-            } catch (_: SocketTimeoutException) {
-            } catch (_: Exception) { if (!running.get()) break }
-        }
     }
 
     private fun streamAudio() {
@@ -122,11 +109,7 @@ class CaptureService : Service() {
                     bytes[5 + i * 2] = (samples[i].toInt() ushr 8).toByte()
                 }
                 seq++
-                val now = SystemClock.elapsedRealtime()
-                clients.entries.forEach { (addr, lastSeen) ->
-                    if (now - lastSeen > 6000) clients.remove(addr)
-                    else try { socket?.send(DatagramPacket(bytes, bytes.size, addr)) } catch (_: Exception) {}
-                }
+                transport?.publish(bytes)
             }
         } catch (e: Exception) { message("Audio stopped: ${e.message}") }
         finally { stopSharing(); stopSelf() }
@@ -136,8 +119,9 @@ class CaptureService : Service() {
         sendBroadcast(Intent(RESULT_ACTION).setPackage(packageName).putExtra("message", value))
     }
     private fun stopSharing() {
-        if (!running.getAndSet(false) && record == null && socket == null) return
-        socket?.close(); socket = null
+        if (!running.getAndSet(false) && record == null && transport == null) return
+        discovery?.close(); discovery = null
+        transport?.close(); transport = null
         try { record?.stop() } catch (_: Exception) {}
         record?.release(); record = null
         try { projection?.stop() } catch (_: Exception) {}

@@ -16,6 +16,8 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var ipInput: EditText
     private var listener: AudioListener? = null
+    private lateinit var discovery: SessionDiscovery
+    private lateinit var sessions: LinearLayout
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -37,7 +39,7 @@ class MainActivity : Activity() {
             textSize = size
             setPadding(0, 0, 0, 14)
         }
-        root.addView(text("Wi-Fi Music Sharing — Phase 2", 23f))
+        root.addView(text("Wi-Fi Music Sharing — Phase 3", 23f))
         root.addView(text("Both phones must use the same Wi-Fi. The host plays music in ReVanced. Only share audio you have permission to distribute.", 14f))
         root.addView(text("HOST (music phone)", 18f))
         root.addView(text("Host local IP: ${localIpv4() ?: "Not found — connect to Wi-Fi"}", 15f))
@@ -49,6 +51,9 @@ class MainActivity : Activity() {
             inputType = android.text.InputType.TYPE_CLASS_PHONE
             setSingleLine(true)
         }
+        sessions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(Button(this).apply { text = "Find nearby sessions / refresh"; setOnClickListener { discovery.browse() } })
+        root.addView(sessions)
         root.addView(ipInput)
         root.addView(Button(this).apply { text = "Join and listen"; setOnClickListener { joinHost() } })
         root.addView(Button(this).apply { text = "Stop listening"; setOnClickListener { listener?.stop(); listener = null; status.text = "Listener stopped" } })
@@ -56,6 +61,13 @@ class MainActivity : Activity() {
         root.addView(status)
         root.addView(text("Tip: If joining fails, confirm both phones can reach each other on Wi-Fi. Some guest networks block device-to-device traffic.", 13f))
         setContentView(ScrollView(this).apply { addView(root) })
+        discovery = SessionDiscovery(this, { found -> runOnUiThread {
+            sessions.removeAllViews()
+            found.forEach { session -> sessions.addView(Button(this).apply {
+                text = "Join ${session.name}"
+                setOnClickListener { ipInput.setText(session.host); joinHost() }
+            }) }
+        } }, { message -> runOnUiThread { status.text = message } })
     }
 
     @Suppress("DEPRECATION")
@@ -113,5 +125,5 @@ class MainActivity : Activity() {
             ?.hostAddress
     } catch (_: Exception) { null }
 
-    override fun onDestroy() { listener?.stop(); super.onDestroy() }
+    override fun onDestroy() { discovery.close(); listener?.stop(); super.onDestroy() }
 }
